@@ -2,13 +2,149 @@
 title: "HW4_Aisha_Al_Khinj"
 output: html_document
 author: "Aisha Al Khinji"
-date : "Feb24th, 2015"
+date : "May 12th, 2015"
 
 ---
 
-Q: Analyze the RNA-seq data presented in: Henn, A. D. et al. High-resolution temporal response patterns to influenza vaccine reveal a distinct human plasma cell gene signature. Scientific Reports 3, 2327 (2013).
+##Q: Analyze the RNA-seq data presented in: Henn, A. D. et al. High-resolution temporal response patterns to influenza vaccine reveal a distinct human plasma cell gene signature. Scientific Reports 3, 2327 (2013).
 
-Download the libraries 
-Bowtie2
-curl
-rsme prep
+  
+##loading the libraries
+```{r, eval=TRUE}
+source("http://bioconductor.org/biocLite.R")
+
+library(GEOquery)
+library(Biobase)
+library(data.table)
+library(limma)
+library(GSEABase)
+library(pheatmap)
+```
+
+
+## Getting the data from GEO
+```{r,eval=TRUE}
+datadir <- "./Data/GEO/"
+dir.create(file.path(datadir), showWarnings = FALSE, recursive = TRUE)
+gds <- getGEO("GSE45735", destdir = getwd())
+gset <- gds[[1]]
+pd <- pData(gds[[1]])
+
+```
+
+## clean up the data
+```{r}
+
+# Note the regular expression to grep file names
+files <- list.files(path = "Data/GEO/", pattern = "GSE45735_T.*.gz", full.names = TRUE)
+
+# Read in gzip-compressed, tab-delimited files
+file_list <- lapply(files, read.table, sep='\t', header=TRUE)
+```
+
+## Using CAMERA##
+
+```{r}
+# Subset to only those rows where Gene contains only non-space characters
+# This addresses problems with T14 file containing 28 invalid rows at end of file
+file_list <- lapply(file_list, function(file_list)subset(file_list, grepl('^[^[:space:]]+$', Gene)))
+
+# Remove duplicated rows
+file_list_unique <- lapply(file_list, function(x){x<-x[!duplicated(x$Gene),]; 
+                                                  x <- x[order(x$Gene),]; 
+                                                  rownames(x) <- x$Gene;
+                                                  x[,-1]})
+# Take the intersection of all genes
+gene_list <- Reduce(intersect, lapply(file_list_unique, rownames))
+file_list_unique <- lapply(file_list_unique, "[", gene_list,)
+matrix <- as.matrix(do.call(cbind, file_list_unique))
+
+```
+
+
+
+# Differentially expressed genes at each time point compared to baseline (day 0) using voom and limma. FDR cutoff = 0.01. Results shown using pheatmap with the log fold-change of the differentially expressed genes grouped by time point.  
+```{r}
+files <- list.files(path="./Data", pattern="GSE45735_T.*.gz", full.names=TRUE)
+
+file_list <- lapply(files, read.table, header=TRUE)
+
+# Clean up the pData
+pd_small <- pd[!grepl("T13_Day8",pd$title),]
+pd_small$Day <- sapply(strsplit(gsub(" \\[PBMC\\]", "", pd_small$title), "_"), "[", 2)
+pd_small$subject <- sapply(strsplit(gsub(" \\[PBMC\\]", "", pd_small$title), "_"), "[", 1)
+colnames(matrix) <- rownames(pd_small)
+```
+
+
+
+
+
+
+```{r}
+# Use Voom and limma
+new_set <- ExpressionSet(assayData=matrix+1)
+pData(new_set) <- pd_small
+
+design <- model.matrix(~subject+Day, new_set)
+voom <- voom(new_set, design=design)
+
+Fit1 <- lmFit(voom, design)
+eBayes1 <- eBayes(Fit1)
+
+# Find differentially expressed genes (FDR = 0.01)
+day <- 1:10
+data_list <- vector("list", length(day))
+for (i in day) {
+  coef <- paste0("DayDay", i)
+  df <- topTable(eBayes1, coef=coef, number=Inf, sort.by="none")
+  data_list[[i]] <- as.data.table(df)
+  data_list[[i]]$gene <- rownames(df)
+  data_list[[i]]$significant <- ifelse(data_list[[i]]$adj.P.Val<0.01, "Yes", "No")
+  setkey(data_list[[i]], gene)
+  }
+
+data_list[[1]]$anytime <- ifelse(data_list[[1]]$significant=="Yes", "Yes", "No")
+for (i in day[-1]) {
+    data_list[[1]]$anytime <- ifelse(data_list[[1]]$significant=="No" & data_list[[i]]$significant=="Yes", "Yes", data_list[[1]]$anytime)
+}
+
+setnames(data_list[[1]],"logFC","Day 1")
+Data <- data_list[[1]][, c("AveExpr","t","P.Value","adj.P.Val","B","significant"):=NULL]
+for (i in 2:length(day)) {
+  setnames(data_list[[i]], "logFC", paste("Day",i))
+  data_list[[i]][, c("AveExpr","t","P.Value","adj.P.Val","B","significant"):=NULL]
+  Data <- merge(Data, data_list[[i]], all.x=TRUE)
+}
+Gene.Data <- data.frame(Data)
+rownames(Gene.Data) <- Data$gene
+colnames(Gene.Data) <- colnames(Data)
+
+Gene.Data <- Gene.Data[Gene.Data$anytime=="Yes",]
+Gene.Data$gene <- NULL
+Gene.Data$anytime <- NULL
+Data_hmap <- data.matrix(Gene.Data)
+
+#Visualize data
+pheatmap(Data_hmap, cluster_cols=FALSE, scale="row")
+```
+
+# Perform a GSEA analysis using camera and the MSigDB Reactome pathway gene signatures. Display the results using pheatmap.
+```{r, cache=TRUE}
+datadir <- "./Data/GEO/"
+dir.create(file.path(datadir), showWarnings = FALSE, recursive = TRUE)
+gsea_set <- getGmt("./Data/c2.all.v4.0.symbols.gmt")
+gene_ids <- geneIds(gsea_set)
+sets_indices <- symbols2indices(gene_ids, rownames(new_set))
+
+# Find enriched sets over time
+res <- vector("list", length=10)
+for (i in 1:10) {
+  contrast <- paste0("DayDay", i)
+  cont_matrix <- makeContrasts(contrast, levels=design)
+  res[[i]] <- camera(voom, sets_indices, design=design, contrast=cont_matrix, sort=FALSE)
+  }
+
+# Visualize data
+P.Value <- sapply(res, function(x){ifelse(x$Direction=="Up", -10*log10(x$PValue), 10*log10(x$PValue))})
+rownames(P.Value) <- rownames(res[[1]])
